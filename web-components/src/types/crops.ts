@@ -24,4 +24,15 @@ export type ImageCropResult = {
   normalizedBoundingBox: NormalizedBoundingBox
   // the rotation applied to the cropped image, in degrees
   rotation: number
+  polygon?: CropCorners
+  normalizedPolygon?: NormalizedPolygon
 }
+
+/** A corner in the unrotated source image, in pixels or normalized units. */
+export type CropPoint = { x: number; y: number }
+
+/** Source corners in clockwise order, starting at the source's top left. */
+export type CropCorners = readonly [CropPoint, CropPoint, CropPoint, CropPoint]
+
+/** Corners in source order with each coordinate relative to the image size. */
+export type NormalizedPolygon = CropCorners

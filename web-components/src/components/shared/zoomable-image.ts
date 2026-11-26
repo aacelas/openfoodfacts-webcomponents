@@ -1,4 +1,5 @@
-import { css, html, LitElement, nothing } from "lit"
+import { css, html, LitElement, nothing, type PropertyValues } from "lit"
+import { ifDefined } from "lit/directives/if-defined.js"
 import { styleMap } from "lit/directives/style-map.js"
 import { customElement, property, query, state } from "lit/decorators.js"
 import { ButtonType, getButtonClasses } from "../../styles/buttons"
@@ -18,9 +19,12 @@ import { FLEX } from "../../styles/utils"
 import type { CropperImageBoundingBox } from "../../types"
 import { EventType } from "../../constants"
 import "../icons/arrows-center"
-import type { CropperActionEvent } from "../../types/crops"
+import "./crop-polygon-overlay"
+import type { CropPolygonOverlay } from "./crop-polygon-overlay"
+import type { CropCorners, CropperActionEvent } from "../../types/crops"
 import { CHECKBOX } from "../../styles/form"
 import { normalizeRotation } from "../../utils"
+import { drawPerspectiveCrop, getCornersBounds } from "../../utils/crop"
 import { MessageDisplayMixin } from "../../mixins/message-display-mixin"
 
 export enum CropMode {
@@ -30,6 +34,7 @@ export enum CropMode {
   CROP_READ = "crop-read",
   // redefining the crop
   CROP = "crop",
+  POLYGON = "polygon",
 }
 
 const MessageDisplayMixinElement = MessageDisplayMixin(LitElement)
@@ -69,6 +74,15 @@ export class ZoomableImage extends MessageDisplayMixinElement {
         gap: 0.5rem;
         margin-top: 0.5rem;
       }
+      .crop-result-buttons {
+        flex-wrap: wrap;
+      }
+
+      .crop-result-image {
+        max-width: 100%;
+        height: auto;
+      }
+
       .crop-result-title {
         font-weight: bold;
         text-align: center;
@@ -94,6 +108,9 @@ export class ZoomableImage extends MessageDisplayMixinElement {
       }
     `,
   ]
+
+  @query("crop-polygon-overlay")
+  private polygonOverlay?: CropPolygonOverlay
 
   @query("cropper-canvas")
   canvasElement!: CropperCanvas
@@ -195,6 +212,13 @@ export class ZoomableImage extends MessageDisplayMixinElement {
   @state()
   private isCanvasEnabledInMobile = false
 
+  @state()
+  private corners?: CropCorners
+
+  private previewCorners?: CropCorners
+  private perspectiveResizeObserver?: ResizeObserver
+  private perspectiveLoad = 0
+
   get isMobileOrTablet() {
     return mobileAndTabletCheck()
   }
@@ -246,6 +270,7 @@ export class ZoomableImage extends MessageDisplayMixinElement {
     // firstUpdated() is only called once; reconnecting needs to restore the listener.
     if (this.canvasElement) {
       this.initZoomLimit()
+      this.observePerspectiveSize()
     }
   }
 
@@ -254,8 +279,48 @@ export class ZoomableImage extends MessageDisplayMixinElement {
    * Used to remove the event listener from the cropper canvas.
    */
   override disconnectedCallback(): void {
+    this.perspectiveResizeObserver?.disconnect()
     this.canvasElement?.removeEventListener("action", this.handleCropperCanvasAction)
     super.disconnectedCallback()
+  }
+
+  override updated(changed: PropertyValues<this>) {
+    if (changed.has("cropMode")) {
+      this.observePerspectiveSize()
+    }
+    if (!changed.has("cropMode") && !changed.has("src") && !changed.has("boundingBox")) {
+      return
+    }
+    const load = ++this.perspectiveLoad
+    if (this.cropMode !== CropMode.POLYGON) {
+      this.clearPerspectivePreview()
+      this.corners = undefined
+      this.polygonOverlay?.cancelDrag()
+      return
+    }
+    this.clearPerspectivePreview()
+    this.corners = undefined
+    this.polygonOverlay?.cancelDrag()
+    void this.imageElement.$ready().then(
+      () => {
+        if (load === this.perspectiveLoad) {
+          this.resetPerspectiveCorners()
+        }
+      },
+      () => {
+        // A failed image load leaves the selection unavailable.
+      }
+    )
+  }
+
+  private observePerspectiveSize() {
+    this.perspectiveResizeObserver?.disconnect()
+    if (this.cropMode === CropMode.POLYGON && typeof ResizeObserver !== "undefined") {
+      this.perspectiveResizeObserver ??= new ResizeObserver(() =>
+        this.polygonOverlay?.requestUpdate()
+      )
+      this.perspectiveResizeObserver.observe(this.canvasElement)
+    }
   }
 
   /**
@@ -291,9 +356,12 @@ export class ZoomableImage extends MessageDisplayMixinElement {
 
     this.initZoomLimit()
     // Reset the rotation when the image is ready to be displayed
-    this.imageElement.$ready(() => {
-      this.resetRotatation()
-    })
+    void this.imageElement.$ready().then(
+      () => this.resetRotatation(),
+      () => {
+        // The image may be missing or fail to load.
+      }
+    )
   }
 
   /**
@@ -332,7 +400,11 @@ export class ZoomableImage extends MessageDisplayMixinElement {
     if (!this.imageElement) return
     try {
       // Reset the selection before rotating the image
-      this.resetSelection()
+      if (this.cropMode === CropMode.POLYGON) {
+        this.clearPerspectivePreview()
+      } else {
+        this.resetSelection()
+      }
 
       if (!this.imageElement.rotatable) {
         // Enable rotation if it's not already enabled (bug fix)
@@ -519,7 +591,20 @@ export class ZoomableImage extends MessageDisplayMixinElement {
    * Gets the current crop selection, in natural image pixels (unrotated frame).
    * @returns The bounding box and rotation, or null if there is no selection.
    */
-  getCropSelection(): { boundingBox: CropperImageBoundingBox; rotation: number } | null {
+  getCropSelection(): {
+    boundingBox: CropperImageBoundingBox
+    rotation: number
+    corners?: CropCorners
+  } | null {
+    if (this.cropMode === CropMode.POLYGON) {
+      return this.corners
+        ? {
+            boundingBox: getCornersBounds(this.corners),
+            rotation: this.currentRotation,
+            corners: this.corners,
+          }
+        : null
+    }
     if (!this.hasSelection()) {
       return null
     }
@@ -534,6 +619,25 @@ export class ZoomableImage extends MessageDisplayMixinElement {
    */
   async showCrop() {
     this.resetMessage()
+    if (this.cropMode === CropMode.POLYGON) {
+      const selection = this.getCropSelection()
+      if (!selection?.corners) {
+        this.setErrorMessage(msg("Please select a region to crop."))
+        return
+      }
+      try {
+        this.cropResult = drawPerspectiveCrop(
+          this.imageElement.$image,
+          selection.corners,
+          selection.rotation
+        ).toDataURL()
+        this.resultBoundingBox = selection.boundingBox
+        this.previewCorners = selection.corners
+      } catch {
+        this.setErrorMessage(msg("An unexpected error occurred."))
+      }
+      return
+    }
     if (!this.hasSelection()) {
       this.setErrorMessage(msg("Please select a region to crop."))
       return
@@ -549,15 +653,18 @@ export class ZoomableImage extends MessageDisplayMixinElement {
    */
   resetSelection() {
     this.resetMessage()
-    this.selectionElement?.$clear()
+    if (this.cropMode === CropMode.POLYGON) {
+      this.resetPerspectiveCorners()
+    } else {
+      this.selectionElement?.$clear()
+    }
   }
 
   /**
    * Resets the crop.
    */
   resetCrop() {
-    this.cropResult = ""
-    this.resultBoundingBox = undefined
+    this.clearPerspectivePreview()
     this.resetSelection()
   }
 
@@ -571,6 +678,7 @@ export class ZoomableImage extends MessageDisplayMixinElement {
           newBoundingBox: this.resultBoundingBox,
           oldBoundingBox: this.boundingBox,
           rotation: this.currentRotation,
+          ...(this.previewCorners && { corners: this.previewCorners }),
         },
       })
     )
@@ -584,7 +692,7 @@ export class ZoomableImage extends MessageDisplayMixinElement {
   renderCropMode() {
     return html`
       <div>
-        ${this.renderMessage()}
+        <div aria-live="polite">${this.renderMessage()}</div>
         <div class="button-container">
           <button
             class="button white-button small"
@@ -619,7 +727,7 @@ export class ZoomableImage extends MessageDisplayMixinElement {
       <div>
         <div class="crop-result-title">${msg("Crop Result")}</div>
         <div class="flex justify-center">
-          <img src=${this.cropResult} alt=${msg("Cropped Image")} />
+          <img class="crop-result-image" src=${this.cropResult} alt=${msg("Cropped Image")} />
         </div>
         <div class="crop-result-buttons flex justify-center gap-0_5">
           <button
@@ -744,7 +852,56 @@ export class ZoomableImage extends MessageDisplayMixinElement {
    * Renders the cropper controls with proper accessibility attributes.
    * @returns The cropper controls UI.
    */
+  private clearPerspectivePreview() {
+    this.cropResult = ""
+    this.resultBoundingBox = undefined
+    this.previewCorners = undefined
+  }
+
+  private resetPerspectiveCorners() {
+    this.clearPerspectivePreview()
+    this.polygonOverlay?.cancelDrag()
+    const image = this.imageElement?.$image
+    if (!image?.naturalWidth || !image.naturalHeight) {
+      this.corners = undefined
+      return
+    }
+    const { naturalWidth: width, naturalHeight: height } = image
+    const box = this.boundingBox
+    const left = Math.max(0, box?.x ?? 0)
+    const top = Math.max(0, box?.y ?? 0)
+    const right = Math.min(width, (box?.x ?? 0) + (box?.width ?? 0))
+    const bottom = Math.min(height, (box?.y ?? 0) + (box?.height ?? 0))
+    this.corners =
+      right > left && bottom > top
+        ? [
+            { x: left, y: top },
+            { x: right, y: top },
+            { x: right, y: bottom },
+            { x: left, y: bottom },
+          ]
+        : [
+            { x: width * 0.1, y: height * 0.1 },
+            { x: width * 0.9, y: height * 0.1 },
+            { x: width * 0.9, y: height * 0.9 },
+            { x: width * 0.1, y: height * 0.9 },
+          ]
+  }
+
+  private onPolygonChange(event: CustomEvent<CropCorners>) {
+    this.corners = event.detail
+    this.clearPerspectivePreview()
+    this.resetMessage()
+  }
+
+  /** Renders the controls for the current crop mode. */
   renderCropperControls() {
+    if (this.cropMode === CropMode.POLYGON) {
+      return html`
+        <cropper-handle action="move" plain aria-hidden="true"></cropper-handle>
+        ${this.corners ? html`<crop-polygon-overlay .imageElement=${this.imageElement} .canvasElement=${this.canvasElement} .corners=${this.corners} .rotation=${this.currentRotation} @polygon-change=${this.onPolygonChange}></crop-polygon-overlay>` : nothing}
+      `
+    }
     if (this.cropMode === CropMode.IMAGE_ONLY) {
       return html`
         <cropper-handle action="move" plain aria-label=${msg("Move image")}></cropper-handle>
@@ -829,6 +986,9 @@ export class ZoomableImage extends MessageDisplayMixinElement {
    * @param event - The transform event.
    */
   onCropperImageTransform(event: CustomEvent<{ matrix: number[] }>) {
+    if (this.cropMode === CropMode.POLYGON) {
+      this.polygonOverlay?.requestUpdate()
+    }
     // If the crop mode is not CROP and you have a selection, you need to update the selection.
     if (this.cropMode !== CropMode.CROP) {
       return
@@ -1007,14 +1167,15 @@ export class ZoomableImage extends MessageDisplayMixinElement {
               scalable
               skewable
               translatable
-              ?crossorigin="${crossorigin}"
+              crossorigin=${ifDefined(crossorigin)}
               @transform=${this.onCropperImageTransform}
             ></cropper-image>
             ${this.renderCropperControls()}
           </cropper-canvas>
         </div>
         ${
-          this.cropMode === CropMode.CROP && !this.hideCropActions
+          (this.cropMode === CropMode.CROP || this.cropMode === CropMode.POLYGON) &&
+          !this.hideCropActions
             ? html` ${this.renderCropMode()} `
             : nothing
         }

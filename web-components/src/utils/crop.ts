@@ -1,6 +1,11 @@
 import type { CropperImageBoundingBox } from "../types"
 import type { RobotoffBoundingBox } from "../types/robotoff"
-import type { NormalizedBoundingBox } from "../types/crops"
+import type {
+  CropCorners,
+  CropPoint,
+  NormalizedBoundingBox,
+  NormalizedPolygon,
+} from "../types/crops"
 
 /**
  * Converts a bounding box from the robotoff format to the crop image format.
@@ -89,7 +94,7 @@ export const normalizeBoundingBox = (
  * @param quality - The output image quality (between 0 and 1), for lossy types.
  * @returns The cropped image as a Blob.
  */
-export const cropImageToBlob = (
+export const cropImageToBlob = async (
   image: CanvasImageSource,
   boundingBox: CropperImageBoundingBox,
   rotation = 0,
@@ -104,6 +109,18 @@ export const cropImageToBlob = (
     // a selection smaller than 1 image pixel would give an empty canvas (toBlob returns null)
     return Promise.reject(new Error("Crop area is too small"))
   }
+  const canvas = drawRotatedCrop(image, x, y, width, height, rotation)
+  return encodeCrop(canvas, type, quality)
+}
+
+function drawRotatedCrop(
+  image: CanvasImageSource,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  rotation: number
+) {
   const outputSize = getRotatedSize(width, height, rotation)
 
   const canvas = document.createElement("canvas")
@@ -111,13 +128,17 @@ export const cropImageToBlob = (
   canvas.height = outputSize.height
   const ctx = canvas.getContext("2d")
   if (!ctx) {
-    return Promise.reject(new Error("Canvas 2D context not available"))
+    throw new Error("Canvas 2D context not available")
   }
   // rotate around the center of the output canvas, then draw the cropped area centered
   ctx.translate(outputSize.width / 2, outputSize.height / 2)
   ctx.rotate((rotation * Math.PI) / 180)
   ctx.drawImage(image, x, y, width, height, -width / 2, -height / 2, width, height)
 
+  return canvas
+}
+
+function encodeCrop(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob(
       (blob) => (blob ? resolve(blob) : reject(new Error("Failed to export cropped image"))),
@@ -125,4 +146,127 @@ export const cropImageToBlob = (
       quality
     )
   })
+}
+
+export function getCornersBounds(corners: CropCorners): CropperImageBoundingBox {
+  const xs = corners.map(({ x }) => x)
+  const ys = corners.map(({ y }) => y)
+  const x = Math.min(...xs)
+  const y = Math.min(...ys)
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y }
+}
+
+export function isConvexCrop(corners: CropCorners): boolean {
+  return corners.every((a, index) => {
+    const b = corners[(index + 1) % 4]
+    const c = corners[(index + 2) % 4]
+    return (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x) > 0
+  })
+}
+
+/** Maps the unit square back to a convex source quadrilateral. */
+export function getPerspectiveTransform(corners: CropCorners): (u: number, v: number) => CropPoint {
+  if (!isConvexCrop(corners)) {
+    throw new Error("Invalid perspective crop")
+  }
+  const [a, b, c, d] = corners
+  const bx = b.x - c.x
+  const by = b.y - c.y
+  const dx = d.x - c.x
+  const dy = d.y - c.y
+  const sx = a.x - b.x + c.x - d.x
+  const sy = a.y - b.y + c.y - d.y
+  const determinant = bx * dy - dx * by
+  const g = (sx * dy - dx * sy) / determinant
+  const h = (bx * sy - sx * by) / determinant
+  const ux = b.x * (1 + g) - a.x
+  const uy = b.y * (1 + g) - a.y
+  const vx = d.x * (1 + h) - a.x
+  const vy = d.y * (1 + h) - a.y
+
+  return (u, v) => {
+    const w = 1 + g * u + h * v
+    return { x: (ux * u + vx * v + a.x) / w, y: (uy * u + vy * v + a.y) / w }
+  }
+}
+
+export function drawPerspectiveCrop(
+  image: HTMLImageElement,
+  corners: CropCorners,
+  rotation: number
+): HTMLCanvasElement {
+  const transform = getPerspectiveTransform(corners)
+  const [a, b, c, d] = corners
+  const distance = (p: CropPoint, q: CropPoint) => Math.hypot(p.x - q.x, p.y - q.y)
+  const width = Math.round(Math.max(distance(a, b), distance(d, c)))
+  const height = Math.round(Math.max(distance(a, d), distance(b, c)))
+  if (width < 1 || height < 1) {
+    throw new Error("Crop area is too small")
+  }
+
+  const bounds = getCornersBounds(corners)
+  const left = Math.floor(bounds.x)
+  const top = Math.floor(bounds.y)
+  const source = document.createElement("canvas")
+  source.width = Math.ceil(bounds.x + bounds.width) - left
+  source.height = Math.ceil(bounds.y + bounds.height) - top
+  const input = source.getContext("2d")
+  if (!input) {
+    throw new Error("Canvas 2D context not available")
+  }
+  input.drawImage(image, -left, -top)
+  const pixels = input.getImageData(0, 0, source.width, source.height).data
+
+  const output = document.createElement("canvas")
+  output.width = width
+  output.height = height
+  const context = output.getContext("2d")
+  if (!context) {
+    throw new Error("Canvas 2D context not available")
+  }
+  const result = context.createImageData(width, height)
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const point = transform((x + 0.5) / width, (y + 0.5) / height)
+      const sampleX = Math.max(0, Math.min(source.width - 1, point.x - left - 0.5))
+      const sampleY = Math.max(0, Math.min(source.height - 1, point.y - top - 0.5))
+      const x0 = Math.floor(sampleX)
+      const y0 = Math.floor(sampleY)
+      const x1 = Math.min(x0 + 1, source.width - 1)
+      const y1 = Math.min(y0 + 1, source.height - 1)
+      const fx = sampleX - x0
+      const fy = sampleY - y0
+      const target = (y * width + x) * 4
+      for (let channel = 0; channel < 4; channel++) {
+        const upper =
+          pixels[(y0 * source.width + x0) * 4 + channel] * (1 - fx) +
+          pixels[(y0 * source.width + x1) * 4 + channel] * fx
+        const lower =
+          pixels[(y1 * source.width + x0) * 4 + channel] * (1 - fx) +
+          pixels[(y1 * source.width + x1) * 4 + channel] * fx
+        result.data[target + channel] = upper * (1 - fy) + lower * fy
+      }
+    }
+  }
+  context.putImageData(result, 0, 0)
+  return rotation % 360 === 0 ? output : drawRotatedCrop(output, 0, 0, width, height, rotation)
+}
+
+export function normalizePolygon(
+  [topLeft, topRight, bottomRight, bottomLeft]: CropCorners,
+  imageWidth: number,
+  imageHeight: number
+): NormalizedPolygon {
+  const normalize = ({ x, y }: CropPoint) => ({ x: x / imageWidth, y: y / imageHeight })
+  return [normalize(topLeft), normalize(topRight), normalize(bottomRight), normalize(bottomLeft)]
+}
+
+export async function warpQuadToBlob(
+  image: HTMLImageElement,
+  corners: CropCorners,
+  rotation: number,
+  type: string,
+  quality?: number
+): Promise<Blob> {
+  return encodeCrop(drawPerspectiveCrop(image, corners, rotation), type, quality)
 }

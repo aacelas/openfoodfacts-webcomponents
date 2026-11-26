@@ -5,8 +5,13 @@ import "../shared/zoomable-image"
 import { CropMode, type ZoomableImage } from "../shared/zoomable-image"
 import { EventType } from "../../constants"
 import type { CropperImageBoundingBox } from "../../types"
-import type { ImageCropResult } from "../../types/crops"
-import { cropImageToBlob, normalizeBoundingBox } from "../../utils/crop"
+import type { CropCorners, ImageCropResult } from "../../types/crops"
+import {
+  cropImageToBlob,
+  normalizeBoundingBox,
+  normalizePolygon,
+  warpQuadToBlob,
+} from "../../utils/crop"
 
 /**
  * ImageCrop is a generic component to crop (and rotate) an image.
@@ -65,6 +70,14 @@ export class ImageCrop extends LitElement {
   @property({ type: Number, attribute: "output-quality" })
   outputQuality?: number
 
+  /** Crop shape used by the editor. */
+  @property({ type: String })
+  mode: "rectangle" | "polygon" = "rectangle"
+
+  /** Initial perspective selection in unrotated source pixels. */
+  @property({ type: Object, attribute: "bounding-box" })
+  boundingBox?: CropperImageBoundingBox
+
   @query("zoomable-image")
   zoomableImage!: ZoomableImage
 
@@ -77,7 +90,7 @@ export class ImageCrop extends LitElement {
     if (!selection) {
       return null
     }
-    return this.buildResult(selection.boundingBox, selection.rotation)
+    return this.buildResult(selection.boundingBox, selection.rotation, selection.corners)
   }
 
   /**
@@ -85,25 +98,23 @@ export class ImageCrop extends LitElement {
    */
   private async buildResult(
     boundingBox: CropperImageBoundingBox,
-    rotation: number
+    rotation: number,
+    corners?: CropCorners
   ): Promise<ImageCropResult> {
     const image = this.zoomableImage.imageElement.$image
-    const blob = await cropImageToBlob(
-      image,
-      boundingBox,
-      rotation,
-      this.outputType,
-      this.outputQuality
-    )
+    const { naturalWidth: imageWidth, naturalHeight: imageHeight } = image
+    const blob = corners
+      ? await warpQuadToBlob(image, corners, rotation, this.outputType, this.outputQuality)
+      : await cropImageToBlob(image, boundingBox, rotation, this.outputType, this.outputQuality)
     return {
       blob,
       boundingBox,
-      normalizedBoundingBox: normalizeBoundingBox(
-        boundingBox,
-        image.naturalWidth,
-        image.naturalHeight
-      ),
+      normalizedBoundingBox: normalizeBoundingBox(boundingBox, imageWidth, imageHeight),
       rotation,
+      ...(corners && {
+        polygon: corners,
+        normalizedPolygon: normalizePolygon(corners, imageWidth, imageHeight),
+      }),
     }
   }
 
@@ -111,16 +122,20 @@ export class ImageCrop extends LitElement {
    * Re-emits the zoomable-image submit (built-in "Validate crop" button) as a crop event.
    */
   private async onSubmit(
-    event: CustomEvent<{ newBoundingBox?: CropperImageBoundingBox; rotation: number }>
+    event: CustomEvent<{
+      newBoundingBox?: CropperImageBoundingBox
+      rotation: number
+      corners?: CropCorners
+    }>
   ) {
     event.stopPropagation()
-    const { newBoundingBox, rotation } = event.detail
+    const { newBoundingBox, rotation, corners } = event.detail
     if (!newBoundingBox) {
       return
     }
     let result: ImageCropResult
     try {
-      result = await this.buildResult(newBoundingBox, rotation)
+      result = await this.buildResult(newBoundingBox, rotation, corners)
     } catch (error) {
       // e.g. crop area too small, or canvas export failure: let the parent show some feedback
       this.dispatchEvent(
@@ -146,7 +161,8 @@ export class ImageCrop extends LitElement {
       <zoomable-image
         src=${this.src}
         .size=${this.size}
-        crop-mode=${CropMode.CROP}
+        crop-mode=${this.mode === "polygon" ? CropMode.POLYGON : CropMode.CROP}
+        .boundingBox=${this.boundingBox}
         ?show-buttons=${this.showButtons}
         ?hide-crop-actions=${this.hideActions}
         @submit=${this.onSubmit}
